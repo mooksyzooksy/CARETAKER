@@ -1,0 +1,53 @@
+cdc:
+  capture:
+    interval-ms: 5000
+  relay:
+    interval-ms: 3000
+    batch-size: 500
+  requeue:
+    interval-ms: 60000
+    max-retries: 5
+  kafka:
+    topic: cdc.events
+
+spring:
+  application:
+    name: cdc-service
+  datasource:
+    url: jdbc:oracle:thin:@//host:1521/service
+    username: ${DB_USER:cdc}
+    password: ${DB_PASSWORD:cdc}
+    driver-class-name: oracle.jdbc.OracleDriver
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    # ─────────────────────────────────────────────────────────────────────────
+    # BROKER-SIDE REQUIREMENTS (enforce in the target Kafka cluster, not here)
+    #
+    # acks=all below is only meaningful if the destination topic (`cdc.events`)
+    # runs with:
+    #     replication.factor        >= 3
+    #     min.insync.replicas       >= 2
+    #     unclean.leader.election   = false
+    #
+    # With min.insync.replicas=1 the producer will still get ACKs from a single
+    # replica, meaning acks=all degrades silently to acks=1 semantics and a
+    # broker failure can lose data. For banking-grade durability the topic
+    # MUST be created with min.insync.replicas >= 2.
+    #
+    # Verify with:
+    #     kafka-configs --bootstrap-server $BROKERS \
+    #         --entity-type topics --entity-name cdc.events --describe
+    # ─────────────────────────────────────────────────────────────────────────
+    producer:
+      acks: all
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        enable.idempotence: true
+        # retries intentionally omitted — idempotent producer forces retries=Integer.MAX_VALUE
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
