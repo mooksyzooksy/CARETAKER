@@ -23,42 +23,46 @@ import java.util.concurrent.CompletableFuture;
  * DB {@code markSent} are not atomic. A crash after broker ack but before DB commit
  * leads to re-publication of the same record on the next tick. This is intrinsic to
  * outbox + Kafka and cannot be eliminated on the producer side without giving up
- * per-record accounting (rule 17 — never fail the whole batch on a single record
- * failure), which rules out Kafka producer transactions at the batch level.
+ * per-record accounting — which rules out Kafka producer transactions at the batch level.
  *
  * <h2>Consumer contract — REQUIRED</h2>
  * Consumers MUST dedupe on the {@link #HEADER_IDEMPOTENCY_KEY} header. The value is
- * {@code {tableName}:{scn}} and is globally unique per Oracle change. A consumer that
- * has already processed a given idempotency key MUST skip the duplicate.
+ * {@code {tableName}:{scn}:{rowSequence}} and is globally unique per Oracle change event.
+ * A consumer that has already processed a given key MUST skip the duplicate silently.
  *
- * <h2>Why (tableName, scn)</h2>
- * Oracle SCN is monotonic per database; tableName + scn uniquely identifies a logical
- * change. Both survive producer restarts, so a re-publication always carries the same
- * key as the original — consumers can dedupe without any producer-side state.
+ * <h2>Why (tableName, scn, rowSequence)</h2>
+ * Oracle SCN is monotonic per database, but a single SCN can cover multiple DML
+ * operations on the same table (e.g. two UPDATEs in the same commit). Using only
+ * {@code (tableName, scn)} as the key would produce a collision for the second operation,
+ * causing consumers to silently discard it. {@code rowSequence} is the intra-SCN
+ * position assigned by the LogMiner library and disambiguates all operations within
+ * the same SCN. The triple {@code (tableName, scn, rowSequence)} is guaranteed unique
+ * and survives producer restarts — a re-publication always carries the same key.
  *
  * <h2>Ordering caveat</h2>
  * The Kafka message key is {@code tableName}, so all changes for one table land on the
- * same partition and Kafka preserves their order. Retries of failed records, however,
- * can re-interleave: a record at {@code scn=N} may be re-sent after a later record at
- * {@code scn=N+1} has already succeeded. Consumers that require strict per-row order
- * must dedupe on idempotency key AND track the highest SCN they have applied per
- * {@code (tableName, primaryKey)}.
+ * same partition and Kafka preserves their publication order. Retries of failed records
+ * can re-interleave with later records that already succeeded. Consumers requiring
+ * strict per-row order must dedupe on the idempotency key AND track the highest SCN
+ * (and rowSequence) applied per {@code (tableName, primaryKey)}.
  *
  * <h2>Headers emitted</h2>
  * <ul>
- *   <li>{@value #HEADER_IDEMPOTENCY_KEY} — {@code {tableName}:{scn}}, the dedupe key</li>
- *   <li>{@value #HEADER_SCN} — the Oracle SCN as a decimal string</li>
- *   <li>{@value #HEADER_TABLE} — source table name</li>
- *   <li>{@value #HEADER_OPERATION} — INSERT / UPDATE / DELETE</li>
+ *   <li>{@value #HEADER_IDEMPOTENCY_KEY} — {@code {tableName}:{scn}:{rowSequence}}</li>
+ *   <li>{@value #HEADER_SCN}             — Oracle SCN as a decimal string</li>
+ *   <li>{@value #HEADER_ROW_SEQUENCE}    — intra-SCN position as a decimal string</li>
+ *   <li>{@value #HEADER_TABLE}           — source table name</li>
+ *   <li>{@value #HEADER_OPERATION}       — INSERT / UPDATE / DELETE</li>
  * </ul>
  */
 @Component
 public class KafkaEventPublisher {
 
     public static final String HEADER_IDEMPOTENCY_KEY = "cdc-idempotency-key";
-    public static final String HEADER_SCN = "cdc-scn";
-    public static final String HEADER_TABLE = "cdc-table";
-    public static final String HEADER_OPERATION = "cdc-operation";
+    public static final String HEADER_SCN             = "cdc-scn";
+    public static final String HEADER_ROW_SEQUENCE    = "cdc-row-sequence";
+    public static final String HEADER_TABLE           = "cdc-table";
+    public static final String HEADER_OPERATION       = "cdc-operation";
 
     private static final Logger log = LoggerFactory.getLogger(KafkaEventPublisher.class);
 
@@ -75,10 +79,9 @@ public class KafkaEventPublisher {
      * Sends all events concurrently. Returns a map of record id → future so the caller
      * can await the whole batch once and inspect each outcome individually.
      *
-     * Synchronous failures (serialization errors, interceptor failures, closed producer)
-     * are trapped per record and exposed as a pre-failed CompletableFuture so the relay's
-     * per-record accounting stays correct even for sync faults — the batch never aborts
-     * mid-loop.
+     * <p>Synchronous failures (serialization errors, interceptor failures, closed producer)
+     * are trapped per record and exposed as a pre-failed {@link CompletableFuture} so the
+     * relay's per-record accounting stays correct — the batch never aborts mid-loop.
      */
     public Map<Long, CompletableFuture<?>> sendAll(Map<Long, CustomEvent> eventsById) {
         Map<Long, CompletableFuture<?>> futures = new LinkedHashMap<>();
@@ -96,16 +99,22 @@ public class KafkaEventPublisher {
     private ProducerRecord<String, Object> buildRecord(CustomEvent event) {
         ProducerRecord<String, Object> record = new ProducerRecord<>(
             topic,
-            null,                    // partition — let the partitioner decide from the key
-            event.tableName(),       // key — per-table partition affinity preserves order
-            event                    // value — serialized as JSON by the configured serializer
+            null,               // partition — let the partitioner decide from the key
+            event.tableName(),  // key — per-table partition affinity preserves SCN order
+            event               // value — serialized as JSON by the configured serializer
         );
-        String idempotencyKey = event.tableName() + ":" + event.scn();
+
+        // (tableName, scn, rowSequence) is the collision-free idempotency triple.
+        // rowSequence disambiguates multiple DML ops sharing the same SCN on the same table.
+        String idempotencyKey = event.tableName() + ":" + event.scn() + ":" + event.rowSequence();
+
         record.headers()
             .add(HEADER_IDEMPOTENCY_KEY, idempotencyKey.getBytes(StandardCharsets.UTF_8))
-            .add(HEADER_SCN, Long.toString(event.scn()).getBytes(StandardCharsets.UTF_8))
-            .add(HEADER_TABLE, event.tableName().getBytes(StandardCharsets.UTF_8))
-            .add(HEADER_OPERATION, event.operation().getBytes(StandardCharsets.UTF_8));
+            .add(HEADER_SCN,          Long.toString(event.scn()).getBytes(StandardCharsets.UTF_8))
+            .add(HEADER_ROW_SEQUENCE, Long.toString(event.rowSequence()).getBytes(StandardCharsets.UTF_8))
+            .add(HEADER_TABLE,        event.tableName().getBytes(StandardCharsets.UTF_8))
+            .add(HEADER_OPERATION,    event.operation().getBytes(StandardCharsets.UTF_8));
+
         return record;
     }
 }
